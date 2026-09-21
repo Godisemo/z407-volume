@@ -1,0 +1,87 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    env:
+      # Release signing identity (self-signed, stored as repo secrets). Absent on forks' pull
+      # requests, which then build ad hoc.
+      SIGNING_P12: ${{ secrets.MACOS_SIGNING_P12 }}
+      SIGNING_PASSWORD: ${{ secrets.MACOS_SIGNING_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select newest Xcode
+        run: |
+          sudo xcode-select -s "$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
+          swift --version
+
+      - name: Import signing certificate
+        if: env.SIGNING_P12 != ''
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 16)"
+          echo "$SIGNING_P12" | base64 --decode > "$RUNNER_TEMP/signing.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/signing.p12" -k "$KEYCHAIN" -P "$SIGNING_PASSWORD" -T /usr/bin/codesign > /dev/null
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/signing.p12"
+          echo "SIGN_IDENTITY=Z407 Volume Release Signing" >> "$GITHUB_ENV"
+
+      - name: Build universal app
+        env:
+          SWIFT_BUILD_FLAGS: --arch arm64 --arch x86_64
+        run: |
+          # Ad hoc unless the release identity was imported above.
+          export SIGN_IDENTITY="${SIGN_IDENTITY:--}"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            export VERSION="${GITHUB_REF_NAME#v}"
+            echo "ZIP=Z407Volume-$VERSION.zip" >> "$GITHUB_ENV"
+          else
+            echo "ZIP=Z407Volume-${GITHUB_SHA::7}.zip" >> "$GITHUB_ENV"
+          fi
+          ./build.sh
+          lipo -archs build/Z407Volume.app/Contents/MacOS/Z407Volume
+          codesign --verify --strict build/Z407Volume.app
+          codesign -d -r- build/Z407Volume.app 2>&1 | grep designated
+
+      - name: Zip
+        run: ditto -c -k --keepParent build/Z407Volume.app "$ZIP"
+
+      - name: Remove signing keychain
+        if: always() && env.SIGNING_P12 != ''
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Z407Volume
+          path: ${{ env.ZIP }}
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Z407Volume
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" Z407Volume-*.zip --repo "$GITHUB_REPOSITORY" --generate-notes
